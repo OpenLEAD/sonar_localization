@@ -1,0 +1,20 @@
+<package>
+  <description brief="Localisation using sonar">
+  Library for performing a localisation using a sonar, utilizing a particle filter
+  </description>
+  <author>Gabriel Alcantara/alcantara@poli.ufrj.br</author>
+  <license></license>
+  <url>http://</url>
+  <logo>http://</logo>
+  <depend package="base/cmake" />
+  <!--
+   To add any dependencies use the depend tag
+  <depend package="dummy-dependency-0" />
+	...
+  <depend package="dummy-dependency-n-1" />
+  <depend package="dummy-dependency-n" />
+  -->
+  <depend package="slam/octomap" />
+  <depend package="slam/sonar_octomap" />
+  <depend package="slam/octomap_wrapper" />
+</package>
