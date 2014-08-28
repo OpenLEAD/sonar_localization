@@ -2,5 +2,5 @@
 # executed from 'project/build' with 'cmake ../'.
 cmake_minimum_required(VERSION 2.6)
 find_package(Rock)
-rock_init(sonar_localisation 0.1)
+rock_init(sonar_localization 0.1)
 rock_standard_layout()
