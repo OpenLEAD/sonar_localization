@@ -1,20 +1,14 @@
 <package>
   <description brief="Localization using a imaging sonar">
-  Localization using a imaging sonar, multibeam or mechanically scanned
+      Particle filter implementation for localization using a imaging sonar, multibeam or mechanically scanned. 
   </description>
   <author>Gabriel Alcantara/alcantara@poli.ufrj.br</author>
   <license></license>
   <url>http://</url>
   <logo>http://</logo>
   <depend package="base/cmake" />
-  <!--
-   To add any dependencies use the depend tag
-  <depend package="dummy-dependency-0" />
-	...
-  <depend package="dummy-dependency-n-1" />
-  <depend package="dummy-dependency-n" />
-  -->
   <depend package="slam/odometry" />
+  <depend package="slam/eslam" />
   <depend package="base/types" />
   <depend package="simulation/gpu_sonar_simulation" />
 </package>
