@@ -18,9 +18,10 @@ namespace imaging_sonar_localization
 struct PoseParticle
 {
     PoseParticle() {};
-    PoseParticle( const base::Vector3d& position, Eigen::Matrix3f orientation)
-	: initial_position(position),
-        orientation(orientation),
+    PoseParticle( const base::Vector2d& position, double water_column, double yaw)
+	: xy_position(position),
+        water_column(water_column),
+        yaw(yaw),
         weight(0) {};
 
     base::Affine3d getPose()
@@ -30,16 +31,12 @@ struct PoseParticle
     }
     
     //3D position
-    base::Vector3d initial_position;
-    
-    base::Vector3d odometry_position;
-    
-    //Orientation matrix
-    Eigen::Matrix3f orientation;
+    base::Vector2d xy_position;
 
-    //Euler Angles
-    double roll;
-    double pitch;
+    double  water_column;
+    
+    //Yaw is sampled by now
+    //TODO change to sample the yaw drift
     double yaw;
 
     double mprob;
