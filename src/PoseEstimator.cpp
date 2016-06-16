@@ -1,16 +1,22 @@
 #include "PoseEstimator.hpp"
 #include <math.h>
-
 using namespace imaging_sonar_localization;
 
 
 
-PoseEstimator::PoseEstimator(const Configuration& config):
-    ParticleFilter<PoseParticle>(10),
+PoseEstimator::PoseEstimator(const Configuration& config,
+        gpu_sonar_simulation::MultibeamSonar& msonar,
+        vizkit3d_normal_depth_map::NormalDepthMap& n_depth_map,
+        vizkit3d_normal_depth_map::ImageViewerCaptureTool& capture): 
+    ParticleFilter<PoseParticle>(config.seed),
     rand_norm(rand_gen, boost::normal_distribution<>(0,1.0) ),
     rand_uni(rand_gen, boost::uniform_real<>(0,1.0) ),
     max_weight(0),
-    projection(config)
+    _msonar(msonar),
+    _normal_depth_map(n_depth_map),
+    _capture(capture),
+    config(config)
+
 {
 }
 
@@ -45,9 +51,8 @@ void PoseEstimator::init(int num_particles, const base::Vector2d& mu_pose,
     {
         base::Vector2d pose_sampled =  samplePose(mu_pose,sigma_pose);
         double yaw_sampled = sampleValue(mu_orientation, sigma_orientation);
-        double wacter_column_sampled = sampleValue(mu_wc,sigma_wc);
-        
-        xi_k.push_back(Particle(pose_sampled, yaw_sampled,wacter_column_sampled));
+        double water_column_sampled = sampleValue(mu_wc,sigma_wc);
+        xi_k.push_back(Particle(pose_sampled, yaw_sampled,water_column_sampled));
     }
 }
 
@@ -86,12 +91,9 @@ void PoseEstimator::project(double u, double v, double r, double dt)
 
     for(size_t i=0; xi_k.size();i++)
     {   
-        //TODO implement correctly the parameters
-        double n_u_sigma, n_v_sigma, n_r_sigma = 0.01;
-
-        double n_u = sampleValue(0,n_u_sigma);
-        double n_v = sampleValue(0,n_v_sigma);
-        double n_r = sampleValue(0,n_r_sigma);
+        double n_u = sampleValue(0,config.n_u_sigma);
+        double n_v = sampleValue(0,config.n_v_sigma);
+        double n_r = sampleValue(0,config.n_r_sigma);
         
         Particle &p(xi_k[i]);
        
@@ -134,8 +136,50 @@ void PoseEstimator::updateSimulatedSonarPose(base::samples::RigidBodyState pose)
 	_capture.setCameraPosition(eye, center, up);
 }
 
+double PoseEstimator::compareSonarData(const base::samples::Sonar& real, const base::samples::Sonar& sim)
+{
+    //TODO validate that the two beams are equivalent
+    
+    //First threshold the data above config.sonarThreshold
+    //Second extract the peak
+    //Last compute the distance r-s and calculate the prob
+    //std::vector<float> 
+    //v.erase(std::remove_if(
+    //            v.begin(), v.end(),
+    //                [](const int& x) { 
+    //                        return x > 10; // put your condition here
+    //                            }), v.end());
+    int bin_count = real.bin_count;
+    int accumulated_dist = 0;
 
-void PoseEstimator::updateWeights(const base::samples::SonarBeam& beam, Eigen::Affine3d& sonar_tf, base::samples::RigidBodyState& abs_data)
+    for(int current_beam=0; current_beam < real.beam_count ; current_beam++)
+    {   
+        int current_beam_idx = current_beam*bin_count; 
+        std::vector<float>::const_iterator it_real,it_sim;
+        std::vector<float>::const_iterator real_current_beam_begin = real.bins.begin()+current_beam_idx;
+        std::vector<float>::const_iterator real_current_beam_end = real.bins.begin()+current_beam_idx+bin_count;
+        std::vector<float>::const_iterator sim_current_beam_begin = sim.bins.begin()+current_beam_idx;
+        std::vector<float>::const_iterator sim_current_beam_end = sim.bins.begin()+current_beam_idx+bin_count;
+
+
+        it_real = std::max_element(real_current_beam_begin,real_current_beam_end);
+        it_sim =  std::max_element(sim_current_beam_begin,sim_current_beam_end);
+        
+        int real_idx =  std::distance(real_current_beam_begin,it_real);
+        int sim_idx =  std::distance(sim_current_beam_begin,it_sim);
+
+        std::cout << "Real Ping:" << real_idx << std::endl;
+        std::cout << "Sim Ping"   << sim_idx << std::endl;
+        
+        accumulated_dist += (real_idx-sim_idx);       
+    }
+    
+
+    return accumulated_dist;
+}
+
+
+void PoseEstimator::updateWeights(const base::samples::Sonar& sonar_data, Eigen::Affine3d& sonar_tf, base::samples::RigidBodyState& abs_data)
 {
     for(size_t i=0; xi_k.size();i++)
     {
@@ -155,8 +199,12 @@ void PoseEstimator::updateWeights(const base::samples::SonarBeam& beam, Eigen::A
 
         base::samples::RigidBodyState simulated_sonar_pose;
         simulated_sonar_pose.position = particle_position;
+        
+        double avg_bearing = (sonar_data.bearings.begin()->rad + sonar_data.bearings.end()->rad)/2;
+        
+
         simulated_sonar_pose.orientation = particle_orientation 
-            * Eigen::AngleAxisd(beam.bearing.rad, Eigen::Vector3d::UnitZ());
+            * Eigen::AngleAxisd(avg_bearing, Eigen::Vector3d::UnitZ());
   
         //TODO incorporate the PTU tf
         
@@ -164,24 +212,25 @@ void PoseEstimator::updateWeights(const base::samples::SonarBeam& beam, Eigen::A
         updateSimulatedSonarPose(simulated_sonar_pose);
 
 	// receive shader image
-	osg::ref_ptr<osg::Image> osg_image = _capture.grabImage(_normal_depth_map.getNormalDepthMapNode());
-	cv::Mat3f cv_image = gpu_sonar_simulation::convertShaderOSG2CV(osg_image);
+	osg::ref_ptr<osg::Image> osg_image = 
+            _capture.grabImage(_normal_depth_map.getNormalDepthMapNode());
+	
+        cv::Mat3f cv_image = gpu_sonar_simulation::convertShaderOSG2CV(osg_image);
 
-	// decode shader image
-	std::vector<double> raw_intensity = _ssonar.decodeShaderImage(cv_image);
 
-	// get ping data
-	std::vector<uint8_t> sonar_data = _ssonar.getPingData(raw_intensity);
+        std::vector<float> sonar_data = _msonar.codeSonarData(cv_image);
 
-	// apply the "gain" (in this case, it is a light intensity change)
-	double gain_factor = _ssonar.getGain() / 0.5;
-	std::transform(sonar_data.begin(), sonar_data.end(), sonar_data.begin(), std::bind1st(std::multiplies<double>(), gain_factor));
+        // apply the "gain" (in this case, it is a light intensity change)
+        float gain_factor = _msonar.getGain() / 0.5;
+        std::transform(sonar_data.begin(), sonar_data.end(), sonar_data.begin(), 
+                    std::bind1st(std::multiplies<float>(), gain_factor));
+        std::replace_if(sonar_data.begin(), sonar_data.end(), bind2nd(greater<float>(), 1.0), 1.0);
 
-	// simulate sonar data
-	base::samples::SonarBeam sonar_beam = _ssonar.simulateSonarBeam(sonar_data);
+        // simulate sonar data
+        base::samples::Sonar sonar = _msonar.simulateMultiBeam(sonar_data);
 
-       //TODO compare simulated with real
-       //TODO assign particle weight 
+        //TODO compare simulated with real
+        //TODO assign particle weight 
     
 
     }    
@@ -189,68 +238,16 @@ void PoseEstimator::updateWeights(const base::samples::SonarBeam& beam, Eigen::A
 
 }
 
-void PoseEstimator::updateWeights(const base::samples::SonarScan& scan, Eigen::Affine3d& sonar_tf)
-{
-    for(size_t i=0; xi_k.size();i++)
-    {
-        //For each particle we need to introduce the information from the
-        //absolute sensors (depth and pitch and roll), as well the
-        //transformation of the PTU when avaiable
-        Particle &p(xi_k[i]);
-
-        Eigen::Vector3d particle_position(p.xy_position[0],p.xy_position[1],0);
-        particle_position += abs_data.position;
-
-        Eigen::Quaterniond particle_orientation(Eigen::AngleAxisd(p.yaw,
-                Eigen::MatrixBase<base:: Vector3d>::UnitZ()));
-        particle_orientation=particle_orientation*abs_data.orientation;
 
 
-
-        base::samples::RigidBodyState simulated_sonar_pose;
-        simulated_sonar_pose.position = particle_position;
-        simulated_sonar_pose.orientation = particle_orientation 
-            * Eigen::AngleAxisd(beam.bearing.rad, Eigen::Vector3d::UnitZ());
-    
-        Task::updateSonarPose(pose);
-
-	// receives shader image
-	osg::ref_ptr<osg::Image> osg_image = _capture.grabImage(_normal_depth_map.getNormalDepthMapNode());
-	cv::Mat3f cv_image = gpu_sonar_simulation::convertShaderOSG2CV(osg_image);
-
-	// simulate sonar data
-	std::vector<uint8_t> sonar_data = _msonar.codeSonarData(cv_image);
-
-	// apply the "gain" (in this case, it is a light intensity change)
-	double gain_factor = _msonar.getGain() / 0.5;
-	std::transform(sonar_data.begin(), sonar_data.end(), sonar_data.begin(), std::bind1st(std::multiplies<double>(), gain_factor));
-
-	// simulate sonar data
-	base::samples::SonarScan sonar_scan = _msonar.simulateSonarScan(sonar_data);
-
-        
-        return;
-
-}
-
-
-void PoseEstimator::update(const base::samples::SonarBeam& beam, Eigen::Affine3d& sonar_tf)
+void PoseEstimator::update(const base::samples::Sonar& sonar_data, Eigen::Affine3d& sonar_tf)
 {
     
     
     //updateWeights(beam,sonar_tf);
     double eff = normalizeWeights();
-    if( eff < 10) //TODO config.minEffective )
+    if( eff < config.minEffective )
     {
 	resample();
     }
 }
-
-void PoseEstimator::update(const base::samples::SonarScan& scan, Eigen::Affine3d& sonar_tf)
-{
-    updateWeights(scan,sonar_tf);
-    double eff = normalizeWeights();
-    if( eff < 10) //TODO config.minEffective )
-    {
-	resample();
-    }
