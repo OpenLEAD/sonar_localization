@@ -40,14 +40,20 @@ struct Configuration
 	spreadThreshold( 0.9 ),
 	spreadTranslationFactor( 0.1 ),
 	spreadRotationFactor( 0.05 ),
+        spreadWaterColumnFactor(0.1),
 	maxYawDeviation( 15*M_PI/180.0 ),
 	measurementThreshold( 0.1, 10*M_PI/180.0 ),
+        minSonarThreshold(0.7),
 	maxSensorRange( 3.0 ),
 	logDebug( false ),
 	logParticlePeriod( 100 ),
         n_u_sigma(0.01),
         n_v_sigma(0.01),
-        n_r_sigma(0.01)
+        n_r_sigma(0.01),
+        fovY(30),
+        fovX(3),
+        value(10),
+        isHeight(true)
     {};
 
     /** seed for all random processes in the filter */
@@ -85,6 +91,9 @@ struct Configuration
     /** spread factor for rotational component
      */
     double spreadRotationFactor;
+    /** spread factor for water column component
+     */
+    double spreadWaterColumnFactor;
     /** when set to a positive value, the filter will try to keep the deviation
      * of the estimated yaw value compared to the yaw value from the odometry
      * to this value
@@ -94,6 +103,11 @@ struct Configuration
      * minimum distance/rotation after which a new measurement is considered.
      */
     UpdateThreshold measurementThreshold;
+    /** minimal echo intensity to be considered a valid echo
+     */
+    double minSonarThreshold;
+
+
     double maxSensorRange;
     /** flag if visual update method should be used.
      */
@@ -107,6 +121,15 @@ struct Configuration
 
     /** variances of the motion model */
     double n_u_sigma, n_v_sigma, n_r_sigma;
+
+    double fovX;
+    
+    double fovY;
+
+    uint value;
+
+    bool isHeight;
+    
 };
 
 }

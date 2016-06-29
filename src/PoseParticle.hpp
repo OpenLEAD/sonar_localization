@@ -1,5 +1,5 @@
 #ifndef __IMAGING_SONAR_POSEPARTICLE_HPP__
-#define __IMAGINS_SONAR_POSEPARTICLE_HPP__
+#define __IMAGING_SONAR_POSEPARTICLE_HPP__
 
 #include <limits>
 #include <Eigen/Core>
@@ -18,19 +18,12 @@ namespace imaging_sonar_localization
 struct PoseParticle
 {
     PoseParticle() {};
-    PoseParticle( const base::Vector2d& position, double water_column, double yaw)
+    PoseParticle( const base::Vector2d& position, double yaw, double water_column)
 	: xy_position(position),
         water_column(water_column),
         yaw(yaw),
         weight(0) {};
 
-    base::Affine3d getPose()
-    {
-	Eigen::Affine3d pose;
-        //TODO
-        return pose;
-    }
-    
     //3D position
     base::Vector2d xy_position;
 

@@ -5,7 +5,7 @@
 #include <boost/random/uniform_real.hpp>
 #include <boost/random/variate_generator.hpp>
 #include <limits>
-
+#include <vector>
 namespace imaging_sonar_localization
 {
 

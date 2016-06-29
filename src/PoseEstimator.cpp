@@ -4,24 +4,20 @@ using namespace imaging_sonar_localization;
 
 
 
-PoseEstimator::PoseEstimator(const Configuration& config,
-        gpu_sonar_simulation::MultibeamSonar& msonar,
-        vizkit3d_normal_depth_map::NormalDepthMap& n_depth_map,
-        vizkit3d_normal_depth_map::ImageViewerCaptureTool& capture): 
+PoseEstimator::PoseEstimator(const Configuration& config):
     ParticleFilter<PoseParticle>(config.seed),
     rand_norm(rand_gen, boost::normal_distribution<>(0,1.0) ),
     rand_uni(rand_gen, boost::uniform_real<>(0,1.0) ),
     max_weight(0),
-    _msonar(msonar),
-    _normal_depth_map(n_depth_map),
-    _capture(capture),
-    config(config)
+    config(config),
+    sonar_sim(NULL)
 
 {
 }
 
 PoseEstimator::~PoseEstimator()
 {
+    delete sonar_sim;
 }
 
 
@@ -29,8 +25,8 @@ base::Vector2d PoseEstimator::samplePose(const base::Vector2d& mu, const base::V
 {
 
     double x = rand_norm(), y= rand_norm();
-    return base::Vector2d(x*sigma[0] + mu[0],
-                          y*sigma[1] +mu[0]);
+    base::Vector2d pose = base::Vector2d(x*sigma[0] + mu[0],
+                          y*sigma[1] + mu[1]);
 
 }
 
@@ -43,10 +39,14 @@ double PoseEstimator::sampleValue(double  mu, double sigma)
 
 
 
-void PoseEstimator::init(int num_particles, const base::Vector2d& mu_pose,
+void PoseEstimator::init(int num_particles, SonarSimulation* sonar_sim, const base::Vector2d& mu_pose,
         const base::Vector2d& sigma_pose, double  mu_orientation, 
         double sigma_orientation, double mu_wc, double sigma_wc)
 {
+ 
+    assert(sonar_sim);
+    this->sonar_sim = sonar_sim;
+
     for (int i=0; i<num_particles; i++)
     {
         base::Vector2d pose_sampled =  samplePose(mu_pose,sigma_pose);
@@ -56,7 +56,6 @@ void PoseEstimator::init(int num_particles, const base::Vector2d& mu_pose,
     }
 }
 
-//TODO verify what is the spread function    
 /**
  * this is a piecewise linear function, with 
  * @param x as the function input
@@ -85,31 +84,46 @@ double weightingFunction( double x, double alpha = 0.1, double beta = 0.9, doubl
 
 
 
-void PoseEstimator::project(double u, double v, double r, double dt)
+void PoseEstimator::project(const base::TwistWithCovariance& input_velocities, double dt)
 {
-    double spread = 0; //weightingFunction( max_weight, 0.0, config.spreadThreshold, 0.0 ); 
+    double spread =0;// weightingFunction( max_weight, 0.0, config.spreadThreshold, 0.0 ); 
 
     for(size_t i=0; xi_k.size();i++)
     {   
-        double n_u = sampleValue(0,config.n_u_sigma);
-        double n_v = sampleValue(0,config.n_v_sigma);
-        double n_r = sampleValue(0,config.n_r_sigma);
-        
-        Particle &p(xi_k[i]);
-       
-        double dx = (u*dt+n_u*dt*dt/2)*cos(p.yaw)+(v*dt+n_v*dt*dt/2)*sin(p.yaw);
-        double dy = (u*dt+n_u*dt*dt/2)*sin(p.yaw)+(v*dt+n_v*dt*dt/2)*cos(p.yaw);
-        double dyaw = r*dt+n_r*dt*dt/2;
+        base::Vector3d linear_velocity = input_velocities.getLinearVelocity();
+        base::Vector3d ang_velocity = input_velocities.getAngularVelocity();
+        base::Matrix3d linear_cov =  input_velocities.getLinearVelocityCov();
+        base::Matrix3d ang_cov = input_velocities.getAngularVelocityCov();
 
-        p.xy_position[0] += dx;
-        p.xy_position[1] += dy;
-        p.yaw += dyaw;
+        double n_u = sampleValue(0,linear_cov(0,0));
+        double n_v = sampleValue(0,linear_cov(1,1));
+        double n_r = sampleValue(0,ang_cov(2,2));
+
+        base::Vector3d velocity_with_error(linear_velocity[0]+n_u,
+                                           linear_velocity[1]+n_v,
+                                           ang_velocity[2]+n_r);
+
+        Particle &p(xi_k[i]);
         
-    
+        //correcting the heading of the vehicle
+        Eigen::AngleAxisd correct_yaw = Eigen::AngleAxisd(p.yaw, Eigen::Vector3d::UnitZ());
+        velocity_with_error = correct_yaw*velocity_with_error*dt;
+              
+        p.xy_position += velocity_with_error.head(2);
+        p.yaw += velocity_with_error[2];
+        
+        //If the max_weight is below a threshold (i.e the filter is lost) 
+        //add random noise (ideally proportional to "how lost you are) to the
+        //particle, to try to recover yourself.
         if(spread>0)
         {
-        // TODO spread the particle to see if the PF recovers itself
-        // spread position and orientation? 
+            const double position_factor = config.spreadTranslationFactor * spread;
+            const double orientation_factor = config.spreadRotationFactor * spread;
+            const double water_column_factor = config.spreadWaterColumnFactor * spread;
+            p.xy_position += samplePose(base::Vector2d(),
+                    base::Vector2d(position_factor,position_factor));
+            p.yaw += sampleValue(0,orientation_factor);
+            p.water_column += sampleValue(0,water_column_factor);  
         }
     
     }
@@ -117,69 +131,65 @@ void PoseEstimator::project(double u, double v, double r, double dt)
 }
 
 
-void PoseEstimator::updateSimulatedSonarPose(base::samples::RigidBodyState pose) {
-
-	// convert OSG (Z-forward) to RoCK coordinate system (X-forward)
-	osg::Matrixd rock_coordinate_matrix = osg::Matrixd::rotate( M_PI_2, osg::Vec3(0, 0, 1)) * osg::Matrixd::rotate(-M_PI_2, osg::Vec3(1, 0, 0));
-
-	// transformation matrixes multiplication
-	osg::Matrixd matrix;
-	matrix.setTrans(osg::Vec3(pose.position.x(), pose.position.y(), pose.position.z()));
-	matrix.setRotate(osg::Quat(pose.orientation.x(), pose.orientation.y(), pose.orientation.z(), pose.orientation.w()));
-	matrix.invert(matrix);
-
-	// correct coordinate system and apply geometric transformations
-	osg::Matrixd m = matrix * rock_coordinate_matrix;
-
-	osg::Vec3 eye, center, up;
-	m.getLookAt(eye, center, up);
-	_capture.setCameraPosition(eye, center, up);
-}
-
 double PoseEstimator::compareSonarData(const base::samples::Sonar& real, const base::samples::Sonar& sim)
 {
+  
+    double weight = 1;
+    if(real.bins.size()!=sim.bins.size())
+    {
+        //TODO error
+    }
+
+    for(size_t i = 0; i<real.bins.size();i++)
+    {
+        double diff = abs(real.bins[i]-sim.bins[i]);
+        weight *= diff; 
+    }
+  
+    return weight;
+  
+  
+  
+  
+  
+  
     //TODO validate that the two beams are equivalent
     
-    //First threshold the data above config.sonarThreshold
-    //Second extract the peak
     //Last compute the distance r-s and calculate the prob
-    //std::vector<float> 
-    //v.erase(std::remove_if(
-    //            v.begin(), v.end(),
-    //                [](const int& x) { 
-    //                        return x > 10; // put your condition here
-    //                            }), v.end());
-    int bin_count = real.bin_count;
-    int accumulated_dist = 0;
+ //   int bin_count = real.bin_count;
+ //   int accumulated_dist = 0;
 
-    for(int current_beam=0; current_beam < real.beam_count ; current_beam++)
-    {   
-        int current_beam_idx = current_beam*bin_count; 
-        std::vector<float>::const_iterator it_real,it_sim;
-        std::vector<float>::const_iterator real_current_beam_begin = real.bins.begin()+current_beam_idx;
-        std::vector<float>::const_iterator real_current_beam_end = real.bins.begin()+current_beam_idx+bin_count;
-        std::vector<float>::const_iterator sim_current_beam_begin = sim.bins.begin()+current_beam_idx;
-        std::vector<float>::const_iterator sim_current_beam_end = sim.bins.begin()+current_beam_idx+bin_count;
+ //   for(int beam=0; beam < real.beam_count ; beam++)
+ //   {   
+ //       int beam_idx = beam*bin_count; 
+ //       std::vector<float>::const_iterator it_real,it_sim;
+ //       std::vector<float>::const_iterator real_beam_begin = real.bins.begin()+beam_idx;
+ //       std::vector<float>::const_iterator real_beam_end = real.bins.begin()+beam_idx+bin_count;
+ //       std::vector<float>::const_iterator sim_beam_begin = sim.bins.begin()+beam_idx;
+ //       std::vector<float>::const_iterator sim_beam_end = sim.bins.begin()+beam_idx+bin_count;
 
 
-        it_real = std::max_element(real_current_beam_begin,real_current_beam_end);
-        it_sim =  std::max_element(sim_current_beam_begin,sim_current_beam_end);
-        
-        int real_idx =  std::distance(real_current_beam_begin,it_real);
-        int sim_idx =  std::distance(sim_current_beam_begin,it_sim);
+ //       it_real = std::max_element(real_beam_begin,real_beam_end);
+ //       it_sim =  std::max_element(sim_beam_begin,sim_beam_end);
+ //       
+ //       if(real.bins[real_idx] < config.minSonarThreshold)
+ //           it_real = real_beam_end;
+ //       if(sim.bins[sim_idx]< config.minSonarThreshold)
+ //           it_sim = sim_beam_end;
+ //
+ //       int real_idx =  std::distance(real_beam_begin,it_real);
+ //       int sim_idx =  std::distance(sim_beam_begin,it_sim);
+ //       
+ //              
+ //       accumulated_dist += (real_idx-sim_idx);       
+ //   }
+ //   
 
-        std::cout << "Real Ping:" << real_idx << std::endl;
-        std::cout << "Sim Ping"   << sim_idx << std::endl;
-        
-        accumulated_dist += (real_idx-sim_idx);       
-    }
-    
-
-    return accumulated_dist;
+ //   return accumulated_dist;
 }
 
 
-void PoseEstimator::updateWeights(const base::samples::Sonar& sonar_data, Eigen::Affine3d& sonar_tf, base::samples::RigidBodyState& abs_data)
+void PoseEstimator::updateWeights(const base::samples::Sonar& sonar_data, const Eigen::Affine3d& sonar_tf,const Eigen::Affine3d& abs_data)
 {
     for(size_t i=0; xi_k.size();i++)
     {
@@ -189,62 +199,112 @@ void PoseEstimator::updateWeights(const base::samples::Sonar& sonar_data, Eigen:
         Particle &p(xi_k[i]);
 
         Eigen::Vector3d particle_position(p.xy_position[0],p.xy_position[1],0);
-        particle_position += abs_data.position;
+        particle_position += abs_data.translation();
 
         Eigen::Quaterniond particle_orientation(Eigen::AngleAxisd(p.yaw,
                 Eigen::MatrixBase<base:: Vector3d>::UnitZ()));
-        particle_orientation=particle_orientation*abs_data.orientation;
+        particle_orientation=particle_orientation*abs_data.rotation();
 
 
 
-        base::samples::RigidBodyState simulated_sonar_pose;
-        simulated_sonar_pose.position = particle_position;
+        Eigen::Affine3d simulated_sonar_pose;
+        simulated_sonar_pose.translation() = particle_position;
         
         double avg_bearing = (sonar_data.bearings.begin()->rad + sonar_data.bearings.end()->rad)/2;
         
 
-        simulated_sonar_pose.orientation = particle_orientation 
-            * Eigen::AngleAxisd(avg_bearing, Eigen::Vector3d::UnitZ());
+        simulated_sonar_pose.rotate(particle_orientation 
+            * Eigen::AngleAxisd(avg_bearing, Eigen::Vector3d::UnitZ()));
   
         //TODO incorporate the PTU tf
         
-        // update the sonar pose in the depth map
-        updateSimulatedSonarPose(simulated_sonar_pose);
-
-	// receive shader image
-	osg::ref_ptr<osg::Image> osg_image = 
-            _capture.grabImage(_normal_depth_map.getNormalDepthMapNode());
-	
-        cv::Mat3f cv_image = gpu_sonar_simulation::convertShaderOSG2CV(osg_image);
-
-
-        std::vector<float> sonar_data = _msonar.codeSonarData(cv_image);
-
-        // apply the "gain" (in this case, it is a light intensity change)
-        float gain_factor = _msonar.getGain() / 0.5;
-        std::transform(sonar_data.begin(), sonar_data.end(), sonar_data.begin(), 
-                    std::bind1st(std::multiplies<float>(), gain_factor));
-        std::replace_if(sonar_data.begin(), sonar_data.end(), bind2nd(greater<float>(), 1.0), 1.0);
-
         // simulate sonar data
-        base::samples::Sonar sonar = _msonar.simulateMultiBeam(sonar_data);
+        base::samples::Sonar sim_sonar_data = sonar_sim->simulateSonarData(simulated_sonar_pose);
 
-        //TODO compare simulated with real
-        //TODO assign particle weight 
+        p.weight =  compareSonarData(sonar_data,sim_sonar_data);
     
 
     }    
-    return;
+
+}
+
+base::Pose PoseEstimator::getCentroid()
+{
+    normalizeWeights();
+
+    // calculate the weighted mean for now
+    base::Pose2D mean;
+    double water_column_mean = 0.0;
+    double sumWeights = 0.0;
+    for(size_t i=0;i<xi_k.size();i++)
+    {
+	const Particle &particle(xi_k[i]);
+	//if( !particle.x.floating )
+	{
+	    mean.position += particle.xy_position * particle.weight;
+	    mean.orientation += particle.yaw * particle.weight;
+	    water_column_mean += particle.water_column * particle.weight;
+	    sumWeights += particle.weight;
+	}
+    }
+    mean.position /= sumWeights;
+    mean.orientation /= sumWeights;
+    water_column_mean /= sumWeights;
+
+
+    base::Orientation mean_orientantion = base::Orientation(Eigen::AngleAxisd( mean.orientation, Eigen::Vector3d::UnitZ()));
+
+    // and convert into a 3d position
+    base::Pose result( 
+	    base::Vector3d( mean.position.x(), mean.position.y(), water_column_mean ), 
+	    mean_orientantion);
+
+    return result;
+}
+
+Statistics PoseEstimator::getStatistics()
+{
+    Statistics stats;
+
+    for(size_t i=0; i<xi_k.size(); i++)
+    {
+        const Particle &particle(xi_k[i]);
+        stats.m_x += particle.xy_position[0];
+        stats.m_y += particle.xy_position[1];
+        stats.m_yaw += particle.yaw;
+        stats.m_wc += particle.water_column;
+    }
+    
+    stats.m_x /= xi_k.size();
+    stats.m_y /= xi_k.size();
+    stats.m_yaw /= xi_k.size();
+    stats.m_wc /= xi_k.size();
+
+    for(size_t i=0; i<xi_k.size(); i++)
+    {
+        const Particle &particle(xi_k[i]);
+        stats.s_x += (stats.m_x - particle.xy_position[0])*(stats.m_x - particle.xy_position[0]);
+        stats.s_y  += (stats.m_y - particle.xy_position[1])*(stats.m_y - particle.xy_position[1]);
+        stats.s_yaw += (stats.m_yaw - particle.yaw)*(stats.m_yaw - particle.yaw);
+        stats.s_wc +=  (stats.m_wc - particle.water_column)*(stats.m_wc - particle.water_column);
+    }
+
+    stats.s_x /= xi_k.size();
+    stats.s_y /= xi_k.size();
+    stats.s_yaw /= xi_k.size();
+    stats.s_wc /= xi_k.size();
+
+
+    return stats;
+
 
 }
 
 
 
-void PoseEstimator::update(const base::samples::Sonar& sonar_data, Eigen::Affine3d& sonar_tf)
+void PoseEstimator::update(const base::samples::Sonar& sonar_data, const Eigen::Affine3d& sonar_tf, const Eigen::Affine3d& abs_data)
 {
-    
-    
-    //updateWeights(beam,sonar_tf);
+    updateWeights(sonar_data, sonar_tf, abs_data);
     double eff = normalizeWeights();
     if( eff < config.minEffective )
     {
